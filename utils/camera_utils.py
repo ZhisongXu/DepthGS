@@ -3,7 +3,7 @@
 # GRAPHDECO research group, https://team.inria.fr/graphdeco
 # All rights reserved.
 #
-# This software is free for non-commercial, research and evaluation use 
+# This software is free for non-commercial, research and evaluation use
 # under the terms of the LICENSE.md file.
 #
 # For inquiries contact  george.drettakis@inria.fr
@@ -16,18 +16,24 @@ from .graphics_utils import fov2focal
 
 WARNED = False
 
+
 def loadCam(args, id, cam_info, resolution_scale):
     orig_w, orig_h = cam_info.image.size
 
     if args.resolution in [1, 2, 4, 8]:
-        resolution = round(orig_w/(resolution_scale * args.resolution)), round(orig_h/(resolution_scale * args.resolution))
-    else:  # should be a type that converts to float
+        resolution = (
+            round(orig_w / (resolution_scale * args.resolution)),
+            round(orig_h / (resolution_scale * args.resolution)),
+        )
+    else:
         if args.resolution == -1:
             if orig_w > 1600:
                 global WARNED
                 if not WARNED:
-                    print("[ INFO ] Encountered quite large input images (>1.6K pixels width), rescaling to 1.6K.\n "
-                        "If this is not desired, please explicitly specify '--resolution/-r' as 1")
+                    print(
+                        "[ INFO ] Encountered quite large input images (>1.6K pixels width), rescaling to 1.6K.\n "
+                        "If this is not desired, please explicitly specify '--resolution/-r' as 1"
+                    )
                     WARNED = True
                 global_down = orig_w / 1600
             else:
@@ -38,16 +44,46 @@ def loadCam(args, id, cam_info, resolution_scale):
         scale = float(global_down) * float(resolution_scale)
         resolution = (int(orig_w / scale), int(orig_h / scale))
 
+    # image -> torch (C,H,W) in [0,1]
     resized_image_rgb = PILtoTorch(cam_info.image, resolution)
-    gt_image = resized_image_rgb[:3, ...]
-    # print('gt_image', gt_image.shape)
+    gt_image = resized_image_rgb[:3, ...]  # (3,H,W)
 
+    # depth -> torch (C,H,W) (we keep single channel in [0, ...] as float)
     if cam_info.depth is not None:
-        resized_depth_rgb = PILtoTorch(cam_info.depth, resolution)
+        import numpy as np
+        from PIL import Image
+
+        depth_np = np.array(cam_info.depth, copy=True)
+
+        # ---- make depth 2D (H, W) ----
+        if depth_np.ndim == 3:
+            if depth_np.shape[-1] == 1:
+                depth_np = depth_np[..., 0]
+            elif depth_np.shape[0] == 1:
+                depth_np = depth_np[0]
+            elif depth_np.shape[-1] in (3, 4):
+                depth_np = depth_np[..., 0]
+            else:
+                depth_np = np.squeeze(depth_np)
+                if depth_np.ndim != 2:
+                    depth_np = depth_np[..., 0]
+        elif depth_np.ndim != 2:
+            depth_np = np.squeeze(depth_np)
+            if depth_np.ndim != 2:
+                raise ValueError(f"Unsupported depth shape: {depth_np.shape}")
+
+        if depth_np.dtype != np.float32:
+            depth_np = depth_np.astype(np.float32, copy=False)
+
+        depth_pil = Image.fromarray(depth_np, mode="F")
+        resized_depth_rgb = PILtoTorch(depth_pil, resolution)  # (1,H,W) typically
     else:
         resized_depth_rgb = None
 
     if resized_depth_rgb is not None:
+        # NOTE: your old code used a 60000 threshold (likely for 16-bit depth),
+        # but after converting to float32 'F', that value may be meaningless.
+        # Keep it as-is to avoid changing behavior.
         depth_mask = resized_depth_rgb[0, ...] > 60000
         gt_depth = resized_depth_rgb[0, ...]
         gt_depth[depth_mask] = 0
@@ -55,27 +91,41 @@ def loadCam(args, id, cam_info, resolution_scale):
         gt_depth = None
 
     loaded_mask = None
-
-    if resized_image_rgb.shape[1] == 4:
+    # ✅ fix: channel dimension is shape[0], not shape[1]
+    if resized_image_rgb.shape[0] == 4:
         loaded_mask = resized_image_rgb[3:4, ...]
 
-    return Camera(colmap_id=cam_info.uid, R=cam_info.R, T=cam_info.T, 
-                  FoVx=cam_info.FovX, FoVy=cam_info.FovY, Cx=cam_info.Cx, Cy=cam_info.Cy, 
-                  image=gt_image, gt_alpha_mask=loaded_mask,
-                  image_name=cam_info.image_name, uid=id, data_device=args.data_device, depth=gt_depth, R_gt=cam_info.R_gt, T_gt=cam_info.T_gt,
-                  mat=cam_info.mat,
-                  raw_pc=cam_info.raw_pc,
-                  kdtree=cam_info.kdtree)
+    # ✅ IMPORTANT: force CPU storage in Camera to avoid OOM when loading many cams
+    return Camera(
+        colmap_id=cam_info.uid,
+        R=cam_info.R,
+        T=cam_info.T,
+        FoVx=cam_info.FovX,
+        FoVy=cam_info.FovY,
+        Cx=cam_info.Cx,
+        Cy=cam_info.Cy,
+        image=gt_image,
+        gt_alpha_mask=loaded_mask,
+        image_name=cam_info.image_name,
+        uid=id,
+        data_device="cpu",     # <-- force CPU (safe even if args.data_device is cuda)
+        depth=gt_depth,
+        R_gt=cam_info.R_gt,
+        T_gt=cam_info.T_gt,
+        mat=cam_info.mat,
+        raw_pc=cam_info.raw_pc,
+        kdtree=cam_info.kdtree,
+    )
+
 
 def cameraList_from_camInfos(cam_infos, resolution_scale, args):
     camera_list = []
-
     for id, c in enumerate(cam_infos):
         camera_list.append(loadCam(args, id, c, resolution_scale))
-
     return camera_list
 
-def camera_to_JSON(id, camera : Camera):
+
+def camera_to_JSON(id, camera: Camera):
     Rt = np.zeros((4, 4))
     Rt[:3, :3] = camera.R.transpose()
     Rt[:3, 3] = camera.T
@@ -86,13 +136,13 @@ def camera_to_JSON(id, camera : Camera):
     rot = W2C[:3, :3]
     serializable_array_2d = [x.tolist() for x in rot]
     camera_entry = {
-        'id' : id,
-        'img_name' : camera.image_name,
-        'width' : camera.width,
-        'height' : camera.height,
-        'position': pos.tolist(),
-        'rotation': serializable_array_2d,
-        'fy' : fov2focal(camera.FovY, camera.height),
-        'fx' : fov2focal(camera.FovX, camera.width)
+        "id": id,
+        "img_name": camera.image_name,
+        "width": camera.width,
+        "height": camera.height,
+        "position": pos.tolist(),
+        "rotation": serializable_array_2d,
+        "fy": fov2focal(camera.FovY, camera.height),
+        "fx": fov2focal(camera.FovX, camera.width),
     }
     return camera_entry

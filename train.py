@@ -1,67 +1,72 @@
 ############################################################
-# Minimal 3DGS training + geometry losses (1~6)
+# SAD-GS style training + geometry losses (1~6) FULL INTEGRATED (CLS REMOVED)
 #
-# 1) Color loss: L1 + DSSIM
-# 2) Depth supervised (if gt depth exists)
-# 3) Scale regularization (if gaussians.get_scaling exists)
-# 4) Normal consistency (no rendered normals -> depth-normal edge-aware smooth)
-# 5) Multi-view color consistency (warp ref render to src, L1 + optional DSSIM)
-# 6) Multi-view depth consistency (warp ref depth to src, Charbonnier)
+# 1) Color loss: L1 + DSSIM                           (CS)
+# 2) Depth supervised (if gt depth exists)            (DS)  [with scale+shift align]
+# 3) Scale regularization (mean scaling)              (SC)
+# 4) Normal consistency substitute:
+#    depth->normal edge-aware smooth                  (NC)
+# 5) Multi-view color consistency (warp ref->src)     (MV_C)
+# 6) Multi-view depth consistency (warp ref->src)     (MV_D) [occlusion-aware via z_pred_in_ref]
 #
-# + Densify/Prune/ResetOpacity (best-effort)
+# + Keep original SAD-GS densify/prune/reset_opacity pipeline
+# + Write cfg_args (for render.py) + command.txt
 #
-# IMPORTANT FIX:
-# - Avoid argparse conflicts with OptimizationParams(parser) etc.
-#   by only adding args if they do NOT already exist.
+# NOTE:
+# - CLS loss removed completely.
+# - MV_D is true multi-view depth consistency (not pixel reprojection geo-loss).
 ############################################################
 
 import os
 import sys
+import time
 import uuid
 import numpy as np
 import torch
 import torch.nn.functional as F
-import nvidia_smi
 
 from random import randint
 from tqdm import tqdm
-from argparse import ArgumentParser
-
-from scene import Scene, GaussianModel
-from gaussian_renderer import render
-from arguments import ModelParams, PipelineParams, OptimizationParams
+from argparse import ArgumentParser, Namespace
 
 from utils.loss_utils import l1_loss, ssim
-from utils.image_utils import psnr
+from gaussian_renderer import render
+from scene import Scene, GaussianModel
 from utils.general_utils import safe_state
+from utils.image_utils import psnr
 
-# -------------------------------
-nvidia_smi.nvmlInit()
+from arguments import ModelParams, PipelineParams, OptimizationParams
 
+# optional dist
+try:
+    from sklearn.neighbors import KDTree
+    import open3d as o3d
+    HAVE_DIST = True
+except Exception:
+    HAVE_DIST = False
+
+# optional tensorboard
 try:
     from torch.utils.tensorboard import SummaryWriter
     TENSORBOARD_FOUND = True
 except ImportError:
     TENSORBOARD_FOUND = False
 
+# optional wandb (avoid interactive login)
+try:
+    import wandb
+    HAVE_WANDB = True
+except Exception:
+    HAVE_WANDB = False
 
-# =========================================================
-# Argparse helper (NO-CONFLICT)
-# =========================================================
-def add_arg_if_absent(parser: ArgumentParser, *name_or_flags, **kwargs):
-    """
-    Add argparse option only if it doesn't exist already.
-    This prevents: argparse.ArgumentError: conflicting option string
-    """
-    existing = set()
-    for act in parser._actions:
-        for opt in getattr(act, "option_strings", []):
-            existing.add(opt)
+# optional nvidia_smi
+try:
+    import nvidia_smi
+    HAVE_NVSMI = True
+except Exception:
+    HAVE_NVSMI = False
 
-    for flag in name_or_flags:
-        if isinstance(flag, str) and flag.startswith("-") and flag in existing:
-            return
-    parser.add_argument(*name_or_flags, **kwargs)
+CHUNK_SIZE = 50000
 
 
 # =========================================================
@@ -70,63 +75,109 @@ def add_arg_if_absent(parser: ArgumentParser, *name_or_flags, **kwargs):
 def charbonnier(x, eps=1e-3):
     return torch.sqrt(x * x + eps * eps)
 
+def list_of_ints(arg):
+    return np.array(arg.split(',')).astype(int)
+
+def save_command(path):
+    cmd = ' '.join(sys.argv)
+    with open(os.path.join(path, 'command.txt'), 'a') as f:
+        f.write(cmd + '\n')
+
+def _num_or(default, x):
+    if x is None:
+        return float(default)
+    try:
+        if torch.is_tensor(x):
+            return float(x.item())
+        return float(x)
+    except Exception:
+        return float(default)
+
+def align_scale_shift(pred_hw, gt_hw, mask_hw, eps=1e-6):
+    """
+    Find a,b to minimize || a*pred + b - gt || on mask.
+    Returns aligned_pred, (a,b).
+    """
+    m = mask_hw
+    if m is None:
+        m = torch.ones_like(gt_hw, dtype=torch.bool)
+
+    if m.sum().item() < 10:
+        return pred_hw, (torch.tensor(1.0, device=pred_hw.device), torch.tensor(0.0, device=pred_hw.device))
+
+    p = pred_hw[m].float()
+    g = gt_hw[m].float()
+
+    mp = p.mean()
+    mg = g.mean()
+
+    vp = (p - mp)
+    cov = (vp * (g - mg)).mean()
+    var = (vp * vp).mean().clamp_min(eps)
+
+    a = cov / var
+    b = mg - a * mp
+    return a * pred_hw + b, (a, b)
+
 def make_K_from_fov(cam, device):
-    W, H = cam.image_width, cam.image_height
-    fx = W / (2.0 * np.tan(float(cam.FoVx) / 2.0))
-    fy = H / (2.0 * np.tan(float(cam.FoVy) / 2.0))
-    cx = W * 0.5
-    cy = H * 0.5
-    K = torch.tensor([[fx, 0, cx],
-                      [0, fy, cy],
-                      [0,  0,  1]], device=device, dtype=torch.float32)
+    W = int(getattr(cam, "image_width"))
+    H = int(getattr(cam, "image_height"))
+
+    # principal point
+    cx = _num_or(W * 0.5, getattr(cam, "Cx", None))
+    cy = _num_or(H * 0.5, getattr(cam, "Cy", None))
+
+    # focal: prefer Fx/Fy if present
+    fx_attr = getattr(cam, "Fx", None)
+    fy_attr = getattr(cam, "Fy", None)
+
+    if fx_attr is not None and fy_attr is not None:
+        fx = _num_or(W / 2.0, fx_attr)
+        fy = _num_or(H / 2.0, fy_attr)
+    else:
+        fovx = getattr(cam, "FoVx", None)
+        fovy = getattr(cam, "FoVy", None)
+        if fovx is None or fovy is None:
+            fx = float(max(W, H))
+            fy = float(max(W, H))
+        else:
+            fovx = _num_or(np.deg2rad(60.0), fovx)
+            fovy = _num_or(np.deg2rad(60.0), fovy)
+            fx = W / (2.0 * np.tan(fovx / 2.0))
+            fy = H / (2.0 * np.tan(fovy / 2.0))
+
+    K = torch.tensor(
+        [[fx, 0.0, cx],
+         [0.0, fy, cy],
+         [0.0, 0.0, 1.0]],
+        device=device, dtype=torch.float32
+    )
     return K
 
-def get_w2c(cam, device, transpose=False):
+def get_w2c_from_RT(cam, device):
     """
-    Robust world-to-camera matrix for different GS forks.
+    SAD-GS uses Pc = R @ Pw + T
     """
-    if hasattr(cam, "world_view_transform"):
-        w2c = cam.world_view_transform
-        if torch.is_tensor(w2c):
-            w2c = w2c.to(device).float()
-            if transpose:
-                w2c = w2c.transpose(0, 1)
-            return w2c
-
-    for name in ["w2c", "W2C", "world2cam", "world_view"]:
-        if hasattr(cam, name):
-            w2c = getattr(cam, name)
-            if torch.is_tensor(w2c) and w2c.shape[-2:] == (4, 4):
-                w2c = w2c.to(device).float()
-                if transpose:
-                    w2c = w2c.transpose(0, 1)
-                return w2c
-
-    if not (hasattr(cam, "R") and hasattr(cam, "T")):
-        raise AttributeError("Camera has no world_view_transform and no R/T")
-
     R = cam.R
     T = cam.T
-
     if not torch.is_tensor(R):
         R = torch.tensor(R, device=device, dtype=torch.float32)
     else:
         R = R.to(device).float()
-
     if not torch.is_tensor(T):
         T = torch.tensor(T, device=device, dtype=torch.float32)
     else:
         T = T.to(device).float()
-
     w2c = torch.eye(4, device=device, dtype=torch.float32)
     w2c[:3, :3] = R
     w2c[:3, 3] = T.view(3)
-
-    if transpose:
-        w2c = w2c.transpose(0, 1)
     return w2c
 
 def backproject(depth_hw, K, w2c):
+    """
+    depth_hw: [H,W] camera depth (Z)
+    return Pw [H,W,3], valid [H,W]
+    """
     device = depth_hw.device
     H, W = depth_hw.shape
     y, x = torch.meshgrid(
@@ -134,31 +185,36 @@ def backproject(depth_hw, K, w2c):
         torch.arange(W, device=device),
         indexing='ij'
     )
-    x = x.float(); y = y.float()
+    x = x.float()
+    y = y.float()
     z = depth_hw
     valid = (z > 0) & torch.isfinite(z)
 
-    fx, fy = K[0,0], K[1,1]
-    cx, cy = K[0,2], K[1,2]
+    fx, fy = K[0, 0], K[1, 1]
+    cx, cy = K[0, 2], K[1, 2]
     X = (x - cx) / fx * z
     Y = (y - cy) / fy * z
 
     Pc = torch.stack([X, Y, z, torch.ones_like(z)], dim=-1)  # [H,W,4]
     c2w = torch.linalg.inv(w2c)
-    Pw = (Pc.reshape(-1,4) @ c2w.T).reshape(H, W, 4)[..., :3]
+    Pw = (Pc.reshape(-1, 4) @ c2w.T).reshape(H, W, 4)[..., :3]
     return Pw, valid
 
 def project(Pw, K, w2c, H, W):
+    """
+    Pw: [H,W,3] -> grid [1,H,W,2] for sampling ref->src
+    Returns: grid, z_pred_in_cam (Zc), valid_z, in_grid
+    """
     device = Pw.device
     ones = torch.ones((H, W, 1), device=device, dtype=Pw.dtype)
     Pw4 = torch.cat([Pw, ones], dim=-1)  # [H,W,4]
-    Pc4 = (Pw4.reshape(-1,4) @ w2c.T).reshape(H, W, 4)
+    Pc4 = (Pw4.reshape(-1, 4) @ w2c.T).reshape(H, W, 4)
 
-    Xc, Yc, Zc = Pc4[...,0], Pc4[...,1], Pc4[...,2]
+    Xc, Yc, Zc = Pc4[..., 0], Pc4[..., 1], Pc4[..., 2]
     valid = (Zc > 1e-6) & torch.isfinite(Zc)
 
-    fx, fy = K[0,0], K[1,1]
-    cx, cy = K[0,2], K[1,2]
+    fx, fy = K[0, 0], K[1, 1]
+    cx, cy = K[0, 2], K[1, 2]
     u = fx * (Xc / (Zc + 1e-8)) + cx
     v = fy * (Yc / (Zc + 1e-8)) + cy
 
@@ -171,13 +227,16 @@ def project(Pw, K, w2c, H, W):
 def depth_to_normal(depth_hw, K):
     device = depth_hw.device
     H, W = depth_hw.shape
-    fx, fy = K[0,0], K[1,1]
-    cx, cy = K[0,2], K[1,2]
+    fx, fy = K[0, 0], K[1, 1]
+    cx, cy = K[0, 2], K[1, 2]
 
-    y, x = torch.meshgrid(torch.arange(H, device=device),
-                          torch.arange(W, device=device),
-                          indexing='ij')
-    x = x.float(); y = y.float()
+    y, x = torch.meshgrid(
+        torch.arange(H, device=device),
+        torch.arange(W, device=device),
+        indexing='ij'
+    )
+    x = x.float()
+    y = y.float()
     z = depth_hw
 
     X = (x - cx) / fx * z
@@ -190,16 +249,16 @@ def depth_to_normal(depth_hw, K):
     dpx = dpx[:, 1:-1, :]
     dpy = dpy[:, :, 1:-1]
 
-    n = torch.cross(dpx.permute(1,2,0), dpy.permute(1,2,0), dim=-1)  # [H-2,W-2,3]
-    n = F.normalize(n, dim=-1, eps=1e-6).permute(2,0,1)
-    n = F.pad(n, (1,1,1,1), mode='replicate')
+    n = torch.cross(dpx.permute(1, 2, 0), dpy.permute(1, 2, 0), dim=-1)  # [H-2,W-2,3]
+    n = F.normalize(n, dim=-1, eps=1e-6).permute(2, 0, 1)               # [3,H-2,W-2]
+    n = F.pad(n, (1, 1, 1, 1), mode='replicate')                         # [3,H,W]
     return n
 
 def edge_weight_from_image(img_chw, k=10.0):
     gx = torch.mean(torch.abs(img_chw[:, :, 1:] - img_chw[:, :, :-1]), dim=0, keepdim=True)
     gy = torch.mean(torch.abs(img_chw[:, 1:, :] - img_chw[:, :-1, :]), dim=0, keepdim=True)
-    gx = F.pad(gx, (1,0,0,0), mode='replicate')
-    gy = F.pad(gy, (0,0,1,0), mode='replicate')
+    gx = F.pad(gx, (1, 0, 0, 0), mode='replicate')
+    gy = F.pad(gy, (0, 0, 1, 0), mode='replicate')
     g = gx + gy
     w = torch.exp(-k * g).clamp(0, 1)
     return w  # [1,H,W]
@@ -210,60 +269,132 @@ def edge_weight_from_image(img_chw, k=10.0):
 # =========================================================
 def prepare_output_and_logger(args):
     if not args.model_path:
-        args.model_path = os.path.join("./output", str(uuid.uuid4())[:8])
+        unique_str = os.getenv('OAR_JOB_ID', str(uuid.uuid4()))
+        args.model_path = os.path.join("./output/", unique_str[0:10])
+
+    print(f"Output folder: {args.model_path}")
     os.makedirs(args.model_path, exist_ok=True)
+
+    with open(os.path.join(args.model_path, "cfg_args"), 'w') as cfg_log_f:
+        cfg_log_f.write(str(Namespace(**vars(args))))
+
+    tb_writer = None
     if TENSORBOARD_FOUND:
-        return SummaryWriter(args.model_path)
-    print("Tensorboard not available")
-    return None
+        tb_writer = SummaryWriter(args.model_path)
+    else:
+        print("Tensorboard not available: not logging progress")
+    return tb_writer
 
 
 # =========================================================
 # Eval
 # =========================================================
-def training_report(iteration, testing_iterations, scene, renderFunc, renderArgs):
-    if iteration not in testing_iterations:
-        return
-    with torch.no_grad():
-        psnr_test = 0.0
-        cams = scene.getTestCameras()
-        for cam in cams:
-            out = renderFunc(cam, scene.gaussians, *renderArgs)
-            img = out["render"]
-            gt = cam.original_image.to(img.device)
-            psnr_test += psnr(img, gt).mean().item()
-        psnr_test /= max(1, len(cams))
-        print(f"[ITER {iteration}] Test PSNR: {psnr_test:.2f}")
+@torch.no_grad()
+def training_report(tb_writer, iteration, Ll1, loss, l1_loss_fn, elapsed, testing_iterations,
+                    scene: Scene, renderFunc, renderArgs):
+    if tb_writer:
+        tb_writer.add_scalar('train_loss_patches/l1_loss', Ll1.item(), iteration)
+        tb_writer.add_scalar('train_loss_patches/total_loss', loss.item(), iteration)
+        tb_writer.add_scalar('iter_time', elapsed, iteration)
+
+    if iteration in testing_iterations:
+        torch.cuda.empty_cache()
+        validation_configs = (
+            {'name': 'test', 'cameras': scene.getTestCameras()},
+            {'name': 'train', 'cameras': [scene.getTrainCameras()[idx % len(scene.getTrainCameras())]
+                                          for idx in range(5, 30, 5)]}
+        )
+
+        for config in validation_configs:
+            if config['cameras'] and len(config['cameras']) > 0:
+                l1_test = 0.0
+                psnr_test = 0.0
+                for viewpoint in config['cameras']:
+                    image = torch.clamp(renderFunc(viewpoint, scene.gaussians, *renderArgs)["render"], 0.0, 1.0)
+                    gt_image = torch.clamp(viewpoint.original_image.to("cuda"), 0.0, 1.0)
+                    l1_test += l1_loss_fn(image, gt_image).mean().double()
+                    psnr_test += psnr(image, gt_image).mean().double()
+                psnr_test /= len(config['cameras'])
+                l1_test /= len(config['cameras'])
+                print(f"\n[ITER {iteration}] Evaluating {config['name']}: L1 {l1_test} PSNR {psnr_test}")
+                if tb_writer:
+                    tb_writer.add_scalar(config['name'] + '/loss_viewpoint - l1_loss', l1_test, iteration)
+                    tb_writer.add_scalar(config['name'] + '/loss_viewpoint - psnr', psnr_test, iteration)
+
+        if tb_writer:
+            tb_writer.add_histogram("scene/opacity_histogram", scene.gaussians.get_opacity, iteration)
+            tb_writer.add_scalar('total_points', scene.gaussians.get_xyz.shape[0], iteration)
+        torch.cuda.empty_cache()
 
 
 # =========================================================
 # Training
 # =========================================================
-def training(dataset, opt, pipe, args):
-    _ = prepare_output_and_logger(dataset)
+def training(dataset, opt, pipe,
+             testing_iterations, saving_iterations,
+             checkpoint_iterations, checkpoint, debug_from, args):
+
+    first_iter = 0
+    tb_writer = prepare_output_and_logger(args)
 
     gaussians = GaussianModel(dataset.sh_degree)
     scene = Scene(
-        dataset,
-        gaussians,
+        dataset, gaussians,
         single_frame_id=args.single_frame_id,
         voxel_size=args.voxel_size,
         init_w_gaussian=args.init_w_gaussian,
         load_ply=args.load_ply
     )
+
     gaussians.training_setup(opt)
+
+    if checkpoint:
+        (model_params, first_iter) = torch.load(checkpoint)
+        gaussians.restore(model_params, opt)
 
     bg_color = [1, 1, 1] if dataset.white_background else [0, 0, 0]
     background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
 
+    iter_start = torch.cuda.Event(enable_timing=True)
+    iter_end   = torch.cuda.Event(enable_timing=True)
+
     viewpoint_stack = None
+    ema_loss_for_log = 0.0
+    progress_bar = tqdm(range(first_iter, opt.iterations), desc="Training progress")
+    first_iter += 1
+    total_computing_time = 0.0
+
     viewpoint_stack_all = scene.getTrainCameras().copy()
-    cameras_extent = getattr(scene, "cameras_extent", None)
 
-    progress_bar = tqdm(range(0, opt.iterations), desc="Training progress")
+    # dist setup (optional)
+    if args.dist:
+        if not HAVE_DIST:
+            raise RuntimeError("args.dist=True but KDTree/open3d not available in this environment.")
+        raw_pc_map = []
+        for v in viewpoint_stack_all:
+            raw_pc_map.append(v.raw_pc)
+        raw_pc_map = np.concatenate(raw_pc_map, axis=0)
+        o3d_pcd = o3d.geometry.PointCloud()
+        o3d_pcd.points = o3d.utility.Vector3dVector(raw_pc_map)
+        raw_pc_map = np.asarray(o3d_pcd.points)
+        kdtree = KDTree(raw_pc_map, leaf_size=1)
+    else:
+        raw_pc_map = None
+        kdtree = None
 
-    for iteration in range(1, opt.iterations + 1):
+    def to_float(x):
+        if x is None:
+            return 0.0
+        if torch.is_tensor(x):
+            return float(x.detach().item())
+        return float(x)
+
+    for iteration in range(first_iter, opt.iterations + 1):
+        tic = time.time()
+
+        iter_start.record()
         gaussians.update_learning_rate(iteration)
+
         if iteration % 1000 == 0:
             gaussians.oneupSHdegree()
 
@@ -271,82 +402,150 @@ def training(dataset, opt, pipe, args):
             viewpoint_stack = scene.getTrainCameras().copy()
         viewpoint_cam = viewpoint_stack.pop(randint(0, len(viewpoint_stack) - 1))
 
+        gt_depth = getattr(viewpoint_cam, "depth", None)
+
+        if (iteration - 1) == debug_from:
+            pipe.debug = True
+
         render_pkg = render(viewpoint_cam, gaussians, pipe, background)
-        image = render_pkg["render"]  # [3,H,W]
-        depth = render_pkg["depth"]
-        depth_hw = depth[0] if depth.dim() == 3 else depth
+        image = render_pkg["render"]
+        viewspace_point_tensor = render_pkg["viewspace_points"]
+        visibility_filter      = render_pkg["visibility_filter"]
+        radii                  = render_pkg["radii"]
+        depth                  = render_pkg["depth"]     # predicted depth
+        alpha                  = render_pkg["alpha"]
 
         gt_image = viewpoint_cam.original_image.to(image.device)
-        gt_depth = viewpoint_cam.depth.to(depth_hw.device) if getattr(viewpoint_cam, "depth", None) is not None else None
 
-        loss = 0.0
+        if args.TUM and gt_depth is not None:
+            gt_d0 = gt_depth if torch.is_tensor(gt_depth) else torch.tensor(gt_depth)
+            gt_d0 = gt_d0.to(image.device)
+            gt_image[:] = gt_image[:] * ~(gt_d0 == 0)
 
-        # 1) color loss
+        # ======================================================
+        # Per-term debug holders
+        # ======================================================
+        loss_color = torch.zeros((), device=image.device)
+        loss_depth = torch.zeros((), device=image.device)
+        loss_alpha = torch.zeros((), device=image.device)
+        loss_sc    = torch.zeros((), device=image.device)
+        loss_nc    = torch.zeros((), device=image.device)
+        loss_mvc   = torch.zeros((), device=image.device)
+        loss_mvd   = torch.zeros((), device=image.device)
+        loss_dist  = torch.zeros((), device=image.device)
+
+        # ======================================================
+        # 1) Color loss
+        # ======================================================
         Ll1 = l1_loss(image, gt_image)
-        color_loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim(image, gt_image))
-        loss = loss + args.CS * color_loss
+        loss_color = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim(image, gt_image))
 
-        # 2) supervised depth loss (if gt exists)
-        if args.DS > 0 and gt_depth is not None:
-            gt = gt_depth.clone()
-            gt[~torch.isfinite(gt)] = 0
-            gt[gt < 0] = 0
+        loss = torch.zeros((), device=image.device)
+        if args.CS is not None and args.CS != 0:
+            loss = loss + loss_color * args.CS
 
-            d = depth_hw.clone()
-            d[~torch.isfinite(d)] = 0
-            d[d < 0] = 0
+        # ======================================================
+        # 2) Depth supervised loss (DS) — fixed (mask + scale/shift align)
+        # ======================================================
+        if args.DS is not None and args.DS != 0 and gt_depth is not None:
+            gt_d = gt_depth if torch.is_tensor(gt_depth) else torch.tensor(gt_depth)
+            gt_d = gt_d.to(image.device).float()
+            pred_d = depth if torch.is_tensor(depth) else torch.tensor(depth, device=image.device, dtype=torch.float32)
 
-            if args.sup_max_depth is not None:
-                gt[gt > args.sup_max_depth] = 0
-                d[d > args.sup_max_depth] = 0
+            pred_hw = pred_d[0] if pred_d.dim() == 3 else pred_d
+            gt_hw   = gt_d[0]   if gt_d.dim() == 3 else gt_d
 
-            valid = (gt > 0) & (d > 0)
-            if valid.any():
-                loss = loss + args.DS * charbonnier(d[valid] - gt[valid]).mean()
+            # sanitize
+            pred_hw = pred_hw.clone()
+            gt_hw   = gt_hw.clone()
+            pred_hw[~torch.isfinite(pred_hw)] = 0
+            gt_hw[~torch.isfinite(gt_hw)] = 0
+            pred_hw[pred_hw < 0] = 0
+            gt_hw[gt_hw < 0] = 0
 
-        # 3) scale regularization
-        if args.SC > 0 and hasattr(gaussians, "get_scaling"):
-            sc = gaussians.get_scaling
-            loss = loss + args.SC * sc.mean()
+            # valid mask (DO NOT zero whole image then mean)
+            mask = (gt_hw > 0) & (pred_hw > 0)
+            if args.ds_max_depth is not None:
+                mask = mask & (gt_hw <= args.ds_max_depth) & (pred_hw <= args.ds_max_depth)
 
-        # 4) depth-normal edge-aware smooth
-        if args.NC > 0:
-            device = image.device
-            K = make_K_from_fov(viewpoint_cam, device)
-            d = depth_hw.clone()
-            d[~torch.isfinite(d)] = 0
-            d[d < 0] = 0
+            if mask.sum().item() >= args.ds_min_valid:
+                if args.ds_align_scale_shift:
+                    pred_aligned, _ = align_scale_shift(pred_hw, gt_hw, mask)
+                    loss_depth = charbonnier(pred_aligned[mask] - gt_hw[mask]).mean()
+                else:
+                    loss_depth = charbonnier(pred_hw[mask] - gt_hw[mask]).mean()
+                loss = loss + loss_depth * args.DS
+            else:
+                loss_depth = torch.zeros((), device=image.device)
+
+        # alpha loss (optional)
+        if args.alpha_loss is not None and args.alpha_loss > 0 and gt_depth is not None:
+            gt_d = gt_depth if torch.is_tensor(gt_depth) else torch.tensor(gt_depth)
+            gt_d = gt_d.to(image.device).float()
+            gt_hw = gt_d[0] if gt_d.dim() == 3 else gt_d
+
+            a = alpha.clone()
+            gt_a = torch.ones_like(a)
+            gt_a[0][gt_hw == 0] = 0
+            a[0][gt_hw != 0] = 1
+            loss_alpha = l1_loss(gt_a, a)
+            loss = loss + loss_alpha * args.alpha_loss
+
+        # ======================================================
+        # 3) Scale regularization
+        # ======================================================
+        if args.SC is not None and args.SC > 0 and hasattr(gaussians, "get_scaling"):
+            loss_sc = gaussians.get_scaling.mean()
+            loss = loss + args.SC * loss_sc
+
+        # ======================================================
+        # 4) Normal consistency substitute (depth-normal edge-aware smooth)
+        # ======================================================
+        if args.NC is not None and args.NC > 0:
+            d_hw = depth[0] if depth.dim() == 3 else depth
+            d_hw = d_hw.clone()
+            d_hw[~torch.isfinite(d_hw)] = 0
+            d_hw[d_hw < 0] = 0
             if args.nc_max_depth is not None:
-                d[d > args.nc_max_depth] = 0
+                d_hw[d_hw > args.nc_max_depth] = 0
 
-            n = depth_to_normal(d, K)
+            K = make_K_from_fov(viewpoint_cam, device=d_hw.device)
+            n = depth_to_normal(d_hw, K)
             w = edge_weight_from_image(gt_image, k=args.NC_edge).detach()
 
             nx = (n[:, :, 1:] - n[:, :, :-1]).abs().mean(0, keepdim=True)
             ny = (n[:, 1:, :] - n[:, :-1, :]).abs().mean(0, keepdim=True)
-            nx = F.pad(nx, (1,0,0,0), mode='replicate')
-            ny = F.pad(ny, (0,0,1,0), mode='replicate')
-            n_smooth = (w * (nx + ny)).mean()
-            loss = loss + args.NC * n_smooth
+            nx = F.pad(nx, (1, 0, 0, 0), mode='replicate')
+            ny = F.pad(ny, (0, 0, 1, 0), mode='replicate')
+            loss_nc = (w * (nx + ny)).mean()
 
-        # 5/6) multi-view consistency
-        if (args.MV_C > 0 or args.MV_D > 0) and len(viewpoint_stack_all) > 1:
-            device = image.device
-            H, W = depth_hw.shape
-            K_src = make_K_from_fov(viewpoint_cam, device)
-            w2c_src = get_w2c(viewpoint_cam, device, transpose=args.w2c_transpose)
+            loss = loss + args.NC * loss_nc
 
-            d_src = depth_hw.clone()
+        # ======================================================
+        # 5/6) Multi-view consistency
+        #   MVC: photometric (warp ref->src)
+        #   MVD: depth consistency (warp ref depth->src) with occlusion-aware gating using z_pred_in_ref
+        # ======================================================
+        do_mv = (iteration >= args.mv_start_iter) and ((iteration % args.mv_interval) == 0)
+        if do_mv and (len(viewpoint_stack_all) > 1) and ((args.MV_C and args.MV_C > 0) or (args.MV_D and args.MV_D > 0)):
+            d_src = depth[0] if depth.dim() == 3 else depth
+            d_src = d_src.clone()
             d_src[~torch.isfinite(d_src)] = 0
             d_src[d_src < 0] = 0
+
             if args.mv_max_depth is not None:
                 d_src[d_src > args.mv_max_depth] = 0
+
+            H, W = d_src.shape
+            K_src = make_K_from_fov(viewpoint_cam, device=d_src.device)
+            w2c_src = get_w2c_from_RT(viewpoint_cam, device=d_src.device)
 
             Pw, v0 = backproject(d_src, K_src, w2c_src)
 
             mv_c_acc = 0.0
             mv_d_acc = 0.0
-            used = 0
+            used_c = 0
+            used_d = 0
 
             for _ in range(args.mv_pairs):
                 ref_cam = viewpoint_stack_all[randint(0, len(viewpoint_stack_all) - 1)]
@@ -357,123 +556,202 @@ def training(dataset, opt, pipe, args):
                 ref_img = ref_pkg["render"].clamp(0, 1)
                 ref_dep = ref_pkg["depth"]
                 ref_dep = ref_dep[0] if ref_dep.dim() == 3 else ref_dep
-
-                K_ref = make_K_from_fov(ref_cam, device)
-                w2c_ref = get_w2c(ref_cam, device, transpose=args.w2c_transpose)
-
-                grid, _, v1, in_grid = project(Pw, K_ref, w2c_ref, H, W)
-
-                ref_img_warp = F.grid_sample(ref_img.unsqueeze(0), grid, align_corners=True).squeeze(0)
-                ref_dep_warp = F.grid_sample(ref_dep.unsqueeze(0).unsqueeze(0), grid, align_corners=True).squeeze(0).squeeze(0)
-
-                d_refw = ref_dep_warp.clone()
-                d_refw[~torch.isfinite(d_refw)] = 0
-                d_refw[d_refw < 0] = 0
+                ref_dep = ref_dep.clone()
+                ref_dep[~torch.isfinite(ref_dep)] = 0
+                ref_dep[ref_dep < 0] = 0
                 if args.mv_max_depth is not None:
-                    d_refw[d_refw > args.mv_max_depth] = 0
+                    ref_dep[ref_dep > args.mv_max_depth] = 0
 
-                vmask = v0 & v1 & in_grid & (d_src > 0)
-                vmask_d = vmask & (d_refw > 0)
+                K_ref = make_K_from_fov(ref_cam, device=d_src.device)
+                w2c_ref = get_w2c_from_RT(ref_cam, device=d_src.device)
 
-                if vmask.sum() < args.mv_min_valid:
-                    continue
+                grid, z_ref_pred, v1, in_grid = project(Pw, K_ref, w2c_ref, H, W)
 
-                if args.MV_C > 0:
-                    l1c = charbonnier((image - ref_img_warp)[:, vmask]).mean()
-                    if args.mv_c_dssim > 0:
-                        if args.mv_c_use_masked_dssim:
-                            imgA = image
-                            imgB = ref_img_warp.clone()
-                            m = vmask.float().unsqueeze(0)
-                            imgB = imgB * m + imgA * (1 - m)
-                            dss = (1.0 - ssim(imgA, imgB))
+                # warp ref -> src grid
+                ref_img_warp = F.grid_sample(ref_img.unsqueeze(0), grid, align_corners=True).squeeze(0)
+                ref_dep_warp = F.grid_sample(ref_dep[None, None], grid, align_corners=True).squeeze(0).squeeze(0)
+
+                # sanitize warped
+                ref_dep_warp = ref_dep_warp.clone()
+                ref_dep_warp[~torch.isfinite(ref_dep_warp)] = 0
+                ref_dep_warp[ref_dep_warp < 0] = 0
+                if args.mv_max_depth is not None:
+                    ref_dep_warp[ref_dep_warp > args.mv_max_depth] = 0
+
+                # base valid
+                m = v0 & v1 & in_grid & (d_src > 0)
+
+                # MVC mask
+                if m.sum().item() >= args.mv_min_valid and args.MV_C and args.MV_C > 0:
+                    mv_c_acc = mv_c_acc + charbonnier((image - ref_img_warp)[:, m]).mean()
+                    used_c += 1
+
+                # MVD mask (need ref depth + occlusion-aware gating)
+                if args.MV_D and args.MV_D > 0:
+                    md = m & (ref_dep_warp > 0)
+
+                    # occlusion-aware: ref depth at warped pixel should match predicted depth of that 3D point in ref camera
+                    # (otherwise it's likely occluded / mismatch)
+                    if args.mv_occ_th is not None and args.mv_occ_th > 0:
+                        md = md & (torch.abs(ref_dep_warp - z_ref_pred) < args.mv_occ_th)
+
+                    if md.sum().item() >= args.mv_min_valid:
+                        if args.mv_align_depth:
+                            # align ref_dep_warp to d_src on mask then compare
+                            ref_aligned, _ = align_scale_shift(ref_dep_warp, d_src, md)
+                            mv_d_acc = mv_d_acc + charbonnier(d_src[md] - ref_aligned[md]).mean()
                         else:
-                            dss = (1.0 - ssim(image, ref_img_warp))
-                        mvc = (1.0 - args.mv_c_dssim) * l1c + args.mv_c_dssim * dss
-                    else:
-                        mvc = l1c
-                    mv_c_acc = mv_c_acc + mvc
+                            mv_d_acc = mv_d_acc + charbonnier(d_src[md] - ref_dep_warp[md]).mean()
+                        used_d += 1
 
-                if args.MV_D > 0 and vmask_d.sum() >= args.mv_min_valid:
-                    mv_d_acc = mv_d_acc + charbonnier(d_src[vmask_d] - d_refw[vmask_d]).mean()
+            if used_c > 0 and args.MV_C and args.MV_C > 0:
+                loss_mvc = mv_c_acc / used_c
+                loss = loss + args.MV_C * loss_mvc
 
-                used += 1
+            if used_d > 0 and args.MV_D and args.MV_D > 0:
+                loss_mvd = mv_d_acc / used_d
+                loss = loss + args.MV_D * loss_mvd
 
-            if used > 0:
-                if args.MV_C > 0:
-                    loss = loss + args.MV_C * (mv_c_acc / used)
-                if args.MV_D > 0:
-                    loss = loss + args.MV_D * (mv_d_acc / used)
+        # ======================================================
+        # dist loss (optional)
+        # ======================================================
+        if args.dist:
+            lambda_distloss = args.dist_w
+            distances, indices = kdtree.query(gaussians.get_xyz.float().detach().cpu().numpy())
+            indices = indices[:, 0]
+            corr_pc = torch.tensor(raw_pc_map[indices], device=image.device, dtype=torch.float32)
+            thres = args.dist_th
+            dist_loss = ((torch.relu(torch.norm(gaussians.get_xyz - corr_pc, dim=1) - thres)) ** 2).mean()
+            loss_dist = dist_loss * lambda_distloss
+            loss = loss + loss_dist
 
-        # ---- backward & step
+        # ======================================================
+        # Opacity reset tricks (kept)
+        # ======================================================
+        margin_scale = 1.0
+
+        if (args.reset_opa_far or args.reset_opa_near) and iteration > 1 and iteration % 100 == 0 and gt_depth is not None:
+            camera_pose = torch.tensor(viewpoint_cam.mat).float().cuda()
+            projmatrix = viewpoint_cam.get_projection_matrix().float().cuda()
+            thres = 0.05 * margin_scale
+            gamma = 0.001
+            if (not args.reset_opa_far) and args.reset_opa_near:
+                gaussians.reset_opacity_by_depth_image_fast(
+                    camera_pose, projmatrix,
+                    gt_depth.shape[1], gt_depth.shape[0],
+                    viewpoint_cam.Cx, viewpoint_cam.Cy,
+                    gt_depth.unsqueeze(0), thres, gamma, near_far=False
+                )
+            elif args.reset_opa_far and args.reset_opa_near:
+                gaussians.reset_opacity_by_depth_image_fast(
+                    camera_pose, projmatrix,
+                    gt_depth.shape[1], gt_depth.shape[0],
+                    viewpoint_cam.Cx, viewpoint_cam.Cy,
+                    gt_depth.unsqueeze(0), thres, gamma, near_far=True
+                )
+            else:
+                print('Error reset_opa flags')
+                sys.exit()
+
+        if args.fov_mask and iteration > 1 and iteration % 100 == 0:
+            camera_pose = torch.tensor(viewpoint_cam.mat).float().cuda()
+            projmatrix = viewpoint_cam.get_projection_matrix().float().cuda()
+            gamma = 0.001
+            gaussians.reset_opacity_outside_fov(camera_pose, projmatrix, image.shape[2], image.shape[1], gamma)
+
+        if args.full_reset_opa and iteration % 100 == 0 and gt_depth is not None:
+            thres = 0.05 * margin_scale
+            gamma = 0.001
+            preserve_mask = None
+            for view_cam_ in viewpoint_stack_all:
+                camera_pose = torch.tensor(view_cam_.mat).float().cuda()
+                projmatrix = view_cam_.get_projection_matrix().float().cuda()
+                gt_depth_ = view_cam_.depth
+
+                reset_depth_mask_ = gaussians.mask_by_depth_image(
+                    camera_pose, projmatrix,
+                    gt_depth_.shape[1], gt_depth_.shape[0],
+                    gt_depth_.unsqueeze(0),
+                    thres, near=True, far=True
+                )
+                reset_fov_mask_ = gaussians.mask_outside_fov(camera_pose, projmatrix, gt_depth_.shape[1], gt_depth_.shape[0]).view(-1, 1)
+
+                reset_mask_ = reset_depth_mask_ + reset_fov_mask_
+                preserve_mask_ = ~reset_mask_
+                if preserve_mask is None:
+                    preserve_mask = preserve_mask_
+                else:
+                    preserve_mask += preserve_mask_
+
+            gaussians.reset_opacity_by_mask(~preserve_mask, gamma)
+
+        # ======================================================
+        # Backward
+        # ======================================================
         loss.backward()
-        gaussians.optimizer.step()
-        gaussians.optimizer.zero_grad(set_to_none=True)
+        iter_end.record()
 
-        # ======================================================
-        # Densification / Pruning / Opacity reset (best-effort)
-        # ======================================================
         with torch.no_grad():
-            has_stats = (
-                hasattr(gaussians, "add_densification_stats") and
-                ("viewspace_points" in render_pkg) and
-                ("visibility_filter" in render_pkg)
+            ema_loss_for_log = 0.4 * loss.item() + 0.6 * ema_loss_for_log
+            if iteration % 10 == 0:
+                progress_bar.set_postfix({"Loss": f"{ema_loss_for_log:.7f}"})
+                progress_bar.update(10)
+
+            if iteration % 100 == 0:
+                print(
+                    f"[{iteration:06d}] "
+                    f"total={to_float(loss):.6f} | "
+                    f"color(CS={args.CS:g})={to_float(loss_color):.6f} "
+                    f"ds(DS={0 if args.DS is None else args.DS:g})={to_float(loss_depth):.6f} "
+                    f"alpha(AL={0 if args.alpha_loss is None else args.alpha_loss:g})={to_float(loss_alpha):.6f} | "
+                    f"sc(SC={args.SC:g})={to_float(loss_sc):.6f} "
+                    f"nc(NC={args.NC:g})={to_float(loss_nc):.6f} | "
+                    f"mvc(MV_C={args.MV_C:g})={to_float(loss_mvc):.6f} "
+                    f"mvd(MV_D={args.MV_D:g})={to_float(loss_mvd):.6f} | "
+                    f"dist={to_float(loss_dist):.6f} "
+                    f"(mv_used={'yes' if do_mv else 'no'})"
+                )
+
+            toc = time.time()
+            total_computing_time += (toc - tic)
+
+            training_report(
+                tb_writer, iteration, Ll1, loss, l1_loss,
+                iter_start.elapsed_time(iter_end),
+                testing_iterations, scene, render, (pipe, background)
             )
-            if has_stats:
-                vsp = render_pkg["viewspace_points"]
-                vis = render_pkg["visibility_filter"]
 
-                # ---- IMPORTANT FIX: adapt signature
-                # Try (vsp, vsp_abs, vis) then fallback to (vsp, vis)
-                try:
-                    if "viewspace_points_abs" in render_pkg:
-                        vsp_abs = render_pkg["viewspace_points_abs"]
-                        gaussians.add_densification_stats(vsp, vsp_abs, vis)
-                    else:
-                        gaussians.add_densification_stats(vsp, vsp, vis)
-                except TypeError:
-                    gaussians.add_densification_stats(vsp, vis)
+            if iteration in saving_iterations:
+                print(f"\n[ITER {iteration}] Saving Gaussians")
+                scene.save(iteration)
 
-                if ("radii" in render_pkg) and hasattr(gaussians, "max_radii2D"):
-                    radii = render_pkg["radii"]
-                    try:
-                        gaussians.max_radii2D[vis] = torch.max(gaussians.max_radii2D[vis], radii[vis])
-                    except Exception:
-                        pass
+            # ======================================================
+            # ORIGINAL SAD-GS DENSIFICATION (keep exactly)
+            # ======================================================
+            if iteration < opt.densify_until_iter:
+                gaussians.max_radii2D[visibility_filter] = torch.max(
+                    gaussians.max_radii2D[visibility_filter], radii[visibility_filter]
+                )
+                gaussians.add_densification_stats(viewspace_point_tensor, visibility_filter)
 
-            if (iteration < args.densify_until_iter) and (iteration > args.densify_from_iter) and (iteration % args.densification_interval == 0):
-                if hasattr(gaussians, "densify_and_prune"):
-                    size_th = args.size_threshold if iteration > args.opacity_reset_interval else None
-                    try:
-                        gaussians.densify_and_prune(
-                            args.densify_grad_threshold,
-                            args.densify_abs_grad_threshold,
-                            args.opacity_cull_threshold,
-                            cameras_extent,
-                            size_th
-                        )
-                    except TypeError:
-                        try:
-                            gaussians.densify_and_prune(args.densify_grad_threshold)
-                        except Exception:
-                            pass
+                if iteration > opt.densify_from_iter and iteration % opt.densification_interval == 0:
+                    size_threshold = 20 if iteration > opt.opacity_reset_interval else None
+                    gaussians.densify_and_prune_original(
+                        opt.densify_grad_threshold, 0.005,
+                        scene.cameras_extent, size_threshold
+                    )
 
-            if iteration < args.densify_until_iter and hasattr(gaussians, "reset_opacity"):
-                if (iteration % args.opacity_reset_interval == 0) or (dataset.white_background and iteration == args.densify_from_iter):
-                    gaussians.reset_opacity()
+            if iteration % opt.opacity_reset_interval == 0 or (dataset.white_background and iteration == opt.densify_from_iter):
+                print('reset_opacity !!!')
+                gaussians.reset_opacity()
 
-        # ---- logs
-        if iteration % 10 == 0:
-            postfix = {"Loss": float(loss.item())}
-            if hasattr(gaussians, "get_xyz"):
-                postfix["Pts"] = int(gaussians.get_xyz.shape[0])
-            progress_bar.set_postfix(postfix)
-            progress_bar.update(10)
+            if iteration < opt.iterations:
+                gaussians.optimizer.step()
+                gaussians.optimizer.zero_grad(set_to_none=True)
 
-        if iteration in args.save_iterations:
-            scene.save(iteration)
-
-        training_report(iteration, args.test_iterations, scene, render, (pipe, background))
+            if iteration in checkpoint_iterations:
+                print(f"\n[ITER {iteration}] Saving Checkpoint")
+                torch.save((gaussians.capture(), iteration), scene.model_path + "/chkpnt" + str(iteration) + ".pth")
 
     progress_bar.close()
     print("\nTraining complete.")
@@ -483,73 +761,118 @@ def training(dataset, opt, pipe, args):
 # Main
 # =========================================================
 if __name__ == "__main__":
-    parser = ArgumentParser()
+    parser = ArgumentParser(description="Training script parameters")
     lp = ModelParams(parser)
     op = OptimizationParams(parser)
     pp = PipelineParams(parser)
 
-    # ---- Loss weights
-    add_arg_if_absent(parser, "--CS", type=float, default=1.0)
-    add_arg_if_absent(parser, "--DS", type=float, default=0.2)
-    add_arg_if_absent(parser, "--SC", type=float, default=1e-4)
-    add_arg_if_absent(parser, "--NC", type=float, default=0.02)
-    add_arg_if_absent(parser, "--MV_C", type=float, default=0.05)
-    add_arg_if_absent(parser, "--MV_D", type=float, default=0.2)
+    parser.add_argument('--ip', type=str, default="127.0.0.1")
+    parser.add_argument('--port', type=int, default=6009)
+    parser.add_argument('--debug_from', type=int, default=-1)
+    parser.add_argument('--detect_anomaly', action='store_true', default=False)
 
-    # ---- Depth ranges
-    add_arg_if_absent(parser, "--sup_max_depth", type=float, default=None)
-    add_arg_if_absent(parser, "--nc_max_depth", type=float, default=10.0)
+    parser.add_argument("--test_iterations", nargs="+", type=int, default=[7_000, 30_000])
+    parser.add_argument("--save_iterations", nargs="+", type=int, default=[7_000, 30_000])
+    parser.add_argument("--quiet", action="store_true")
+    parser.add_argument("--checkpoint_iterations", nargs="+", type=int, default=[])
+    parser.add_argument("--start_checkpoint", type=str, default=None)
 
-    # ---- Normal smooth settings
-    add_arg_if_absent(parser, "--NC_edge", type=float, default=10.0)
+    # -------------------------
+    # Loss weights (1~6 default ON)
+    # -------------------------
+    parser.add_argument("--CS", type=float, default=1.0)
+    parser.add_argument("--DS", type=float, default=0.2)
+    parser.add_argument("--alpha_loss", type=float, default=0.0)
 
-    # ---- MV settings
-    add_arg_if_absent(parser, "--mv_pairs", type=int, default=1)
-    add_arg_if_absent(parser, "--mv_max_depth", type=float, default=10.0)
-    add_arg_if_absent(parser, "--mv_min_valid", type=int, default=2000)
-    add_arg_if_absent(parser, "--w2c_transpose", action="store_true", default=False)
+    parser.add_argument("--SC", type=float, default=1e-4)
+    parser.add_argument("--NC", type=float, default=0.02)
+    parser.add_argument("--MV_C", type=float, default=0.05)
+    parser.add_argument("--MV_D", type=float, default=0.2)
 
-    add_arg_if_absent(parser, "--mv_c_dssim", type=float, default=0.0)
-    add_arg_if_absent(parser, "--mv_c_use_masked_dssim", action="store_true", default=True)
+    # NC config
+    parser.add_argument("--NC_edge", type=float, default=10.0)
+    parser.add_argument("--nc_max_depth", type=float, default=10.0)
 
-    # ---- densify/prune knobs
-    add_arg_if_absent(parser, "--densify_from_iter", type=int, default=500)
-    add_arg_if_absent(parser, "--densify_until_iter", type=int, default=15000)
-    add_arg_if_absent(parser, "--densification_interval", type=int, default=100)
-    add_arg_if_absent(parser, "--opacity_reset_interval", type=int, default=3000)
+    # DS config (fixed)
+    parser.add_argument("--ds_align_scale_shift", action="store_true", default=True)
+    parser.add_argument("--ds_min_valid", type=int, default=2000)
+    parser.add_argument("--ds_max_depth", type=float, default=10.0)
 
-    add_arg_if_absent(parser, "--densify_grad_threshold", type=float, default=2e-4)
-    add_arg_if_absent(parser, "--densify_abs_grad_threshold", type=float, default=2e-4)
-    add_arg_if_absent(parser, "--opacity_cull_threshold", type=float, default=0.005)
-    add_arg_if_absent(parser, "--size_threshold", type=float, default=20.0)
+    # MV config
+    parser.add_argument("--mv_start_iter", type=int, default=1)
+    parser.add_argument("--mv_interval", type=int, default=1)     # every step for debug
+    parser.add_argument("--mv_pairs", type=int, default=1)
+    parser.add_argument("--mv_max_depth", type=float, default=10.0)
+    parser.add_argument("--mv_min_valid", type=int, default=2000)
 
-    # ---- scene options
-    add_arg_if_absent(parser, "--load_ply", action="store_true", default=False)
-    add_arg_if_absent(parser, "--init_w_gaussian", action="store_true", default=False)
-    add_arg_if_absent(parser, "--voxel_size", type=float, default=None)
-    add_arg_if_absent(parser, "--single_frame_id",
-                      type=lambda x: np.array(x.split(",")).astype(int),
-                      default=[])
+    # MV depth consistency (occlusion-aware)
+    parser.add_argument("--mv_occ_th", type=float, default=0.05)         # meters-ish; tune 0.02~0.1
+    parser.add_argument("--mv_align_depth", action="store_true", default=False)
+
+    # -------------------------
+    # Optional dist loss
+    # -------------------------
+    parser.add_argument("--dist", action="store_true", default=False)
+    parser.add_argument("--dist_w", type=float, default=1e1)
+    parser.add_argument("--dist_th", type=float, default=0.0)
+
+    # -------------------------
+    # Opacity tricks
+    # -------------------------
+    parser.add_argument("--reset_opa_far", action="store_true", default=False)
+    parser.add_argument("--reset_opa_near", action="store_true", default=False)
+    parser.add_argument("--fov_mask", action="store_true", default=False)
+    parser.add_argument("--full_reset_opa", action="store_true", default=False)
+
+    # -------------------------
+    # Scene options
+    # -------------------------
+    parser.add_argument("--load_ply", action="store_true", default=False)
+    parser.add_argument("--init_w_gaussian", action="store_true", default=False)
+    parser.add_argument("--voxel_size", type=float, default=None)
+    parser.add_argument("--single_frame_id", type=list_of_ints, default=[])
+
+    # misc
+    parser.add_argument("--wandb", action="store_true", default=False)
+    parser.add_argument("--TUM", action="store_true", default=False)
 
     args = parser.parse_args(sys.argv[1:])
-
-    if not hasattr(args, "iterations"):
-        args.iterations = op.iterations
-
-    if not hasattr(args, "save_iterations"):
-        args.save_iterations = []
-    if not hasattr(args, "test_iterations"):
-        args.test_iterations = []
-
     args.save_iterations.append(args.iterations)
 
-    safe_state(False)
+    print("Optimizing " + args.model_path)
+
+    # wandb (never interactive)
+    if args.wandb and HAVE_WANDB:
+        # if you export WANDB_MODE=disabled, wandb will stay disabled anyway.
+        mode = os.environ.get("WANDB_MODE", "online")
+        name = args.model_path.split('/')[-1]
+        wandb.init(project='gaussian_splatting', name=name, config={}, save_code=True, notes="", mode=mode)
+    elif args.wandb and (not HAVE_WANDB):
+        print("[WARN] args.wandb=True but wandb not installed; disabling wandb.")
+
+    if HAVE_NVSMI:
+        try:
+            nvidia_smi.nvmlInit()
+        except Exception:
+            pass
+
+    os.makedirs(args.model_path, exist_ok=True)
+    save_command(args.model_path)
+
+    safe_state(args.quiet)
+    torch.autograd.set_detect_anomaly(args.detect_anomaly)
 
     training(
-        lp.extract(args),
-        op.extract(args),
-        pp.extract(args),
-        args
+        lp.extract(args), op.extract(args), pp.extract(args),
+        args.test_iterations, args.save_iterations,
+        args.checkpoint_iterations, args.start_checkpoint,
+        args.debug_from, args
     )
 
-    nvidia_smi.nvmlShutdown()
+    if HAVE_NVSMI:
+        try:
+            nvidia_smi.nvmlShutdown()
+        except Exception:
+            pass
+
+    print("\nTraining complete.")
